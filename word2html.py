@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-word2html.py —— 将当前文件夹内的所有 Word 文档 (.docx) 转换为单文件 HTML。
+word2html.py —— 将当前文件夹内的所有 Word 文档 (.docx / .doc) 转换为单文件 HTML。
 
 特点：
   * 保留原文档的标题、列表、表格、图片等格式
   * 图片以 base64 内嵌，输出为单个 HTML 文件（可离线打开、可发邮件）
   * 数学 / 科学公式使用 MathML，浏览器原生渲染，无需联网、无需 MathJax
   * 老式公式编辑器存的 WMF/EMF 公式图（浏览器显示不了），自动用 LibreOffice
-    转成高清 PNG、裁掉白边再回写
+    转成高清 PNG、裁掉白边再回写，并按 Word 里声明的原尺寸显示
+  * 老式 .doc（二进制格式）先由 LibreOffice 转成 docx 再交给 pandoc
   * 单个文件失败不影响其它文件
 
 依赖：
   * pandoc >= 2.x
     安装：sudo apt install pandoc
-  * LibreOffice + Pillow（可选）：仅当文档里的公式是 WMF/EMF 图片时需要
+  * LibreOffice：.doc 转换、WMF/EMF 公式图转换都需要
+  * Pillow：公式图裁白边需要
     安装：sudo apt install libreoffice python3-pil
 """
 
@@ -29,7 +31,7 @@ import zipfile
 from pathlib import Path
 
 # ------------------ 可配置项 ------------------
-INPUT_EXTENSIONS = {".docx"}   # 要转换的扩展名（小写）
+INPUT_EXTENSIONS = {".docx", ".doc"}   # 要转换的扩展名（小写）
 OUTPUT_SUFFIX    = ".html"     # 输出后缀
 OVERWRITE        = True        # 已存在同名 HTML 时是否覆盖
 ADD_TOC          = True        # 是否生成目录
@@ -114,6 +116,8 @@ def find_soffice() -> str | None:
 # 公式图：pandoc 对老式公式（MathType/公式编辑器 3.0）只会原样输出 WMF/EMF 图片，
 # 浏览器一律显示不出来，必须转格式
 FORMULA_RE = re.compile(r'src="(data:image/x-(wmf|emf);base64,([A-Za-z0-9+/=]+))"')
+BLANK_PNG = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+             "AAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg==")   # 1×1 透明图
 PAGE_W_PX = round(8.27 * FORMULA_DPI)   # A4 竖版按 FORMULA_DPI 光栅化的像素宽
 PAGE_H_PX = round(11.69 * FORMULA_DPI)
 
@@ -217,16 +221,18 @@ def fix_formula_images(dst: Path, soffice: str, sizes: dict) -> None:
             if not out.is_file():
                 continue
             im = Image.open(out).convert("RGB")
-            bg = Image.new("RGB", im.size, (255, 255, 255))
-            bbox = ImageChops.difference(im, bg).getbbox()
-            if not bbox:
+            declared = sizes.get(hashlib.sha1(raws[blob]).hexdigest())
+            bbox = ImageChops.difference(im, Image.new("RGB", im.size, (255, 255, 255))).getbbox()
+            if not bbox:                     # 空白图：换成透明图，免得浏览器显示碎图图标
+                mapping[blob] = (BLANK_PNG,
+                                 max(1, round(declared[0] * 96 / 72)) if declared else 1,
+                                 max(1, round(declared[1] * 96 / 72)) if declared else None)
                 continue
             pad = 4
             box = (max(bbox[0] - pad, 0), max(bbox[1] - pad, 0),
                    min(bbox[2] + pad, im.width), min(bbox[3] + pad, im.height))
             im.crop(box).save(out, optimize=True)
             w_px = h_px = None
-            declared = sizes.get(hashlib.sha1(raws[blob]).hexdigest())
             if declared:
                 w_px = max(1, round(declared[0] * 96 / 72))     # pt → CSS px
                 h_px = max(1, round(declared[1] * 96 / 72))
@@ -256,43 +262,69 @@ def fix_formula_images(dst: Path, soffice: str, sizes: dict) -> None:
           f"（{from_docx} 个按 Word 原尺寸显示）")
 
 
-def convert_one(pandoc: str, src: Path, header_file: Path,
-                soffice: str | None, sizes: dict) -> bool:
-    """把单个 docx 转成单文件 html。成功返回 True。"""
+def doc_to_docx(src: Path, soffice: str, outdir: Path) -> Path | None:
+    """老式 .doc 是二进制格式，pandoc 读不了，先让 LibreOffice 转成 docx。"""
+    cmd = [soffice, "--headless", "--norestore",
+           "-env:UserInstallation=file://" + str(outdir),
+           "--convert-to", "docx", "--outdir", str(outdir), str(src)]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=300)
+    except subprocess.TimeoutExpired:
+        print(f"  [失败] {src.name}: LibreOffice 转 docx 超时")
+        return None
+    out = outdir / (src.stem + ".docx")
+    return out if out.is_file() else None
+
+
+def convert_one(pandoc: str, src: Path, header_file: Path, soffice: str | None) -> bool:
+    """把单个 docx / doc 转成单文件 html。成功返回 True。"""
     dst = src.with_suffix(OUTPUT_SUFFIX)
 
     if dst.exists() and not OVERWRITE:
         print(f"  [跳过] {dst.name} 已存在")
         return True
 
-    cmd = [
-        pandoc,
-        str(src),
-        "-o", str(dst),
-        "--standalone",               # 生成完整 HTML（含 head/body）
-        "--embed-resources",          # 图片/CSS 全部内嵌 → 真正的单文件
-        "--mathml",                   # 公式用 MathML，浏览器原生支持
-        "--metadata", f"title={src.stem}",
-        "--resource-path", str(src.parent),
-        "--include-in-header", str(header_file),
-    ]
-    if ADD_TOC:
-        cmd += ["--toc", f"--toc-depth={TOC_DEPTH}"]
+    with tempfile.TemporaryDirectory(prefix="w2h_doc_") as td:
+        pandoc_src = src
+        if src.suffix.lower() == ".doc":
+            if not soffice:
+                print(f"  [失败] {src.name}: .doc 需要 LibreOffice 先转 docx"
+                      "（sudo apt install libreoffice）")
+                return False
+            pandoc_src = doc_to_docx(src, soffice, Path(td))
+            if not pandoc_src:
+                print(f"  [失败] {src.name}: LibreOffice 没能把它转成 docx")
+                return False
+            print(f"  [doc]  {src.name} → 临时 docx")
 
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    except Exception as e:
-        print(f"  [失败] {src.name}: {e}")
-        return False
+        cmd = [
+            pandoc,
+            str(pandoc_src),
+            "-o", str(dst),
+            "--standalone",               # 生成完整 HTML（含 head/body）
+            "--embed-resources",          # 图片/CSS 全部内嵌 → 真正的单文件
+            "--mathml",                   # 公式用 MathML，浏览器原生支持
+            "--metadata", f"title={src.stem}",
+            "--resource-path", str(src.parent),
+            "--include-in-header", str(header_file),
+        ]
+        if ADD_TOC:
+            cmd += ["--toc", f"--toc-depth={TOC_DEPTH}"]
 
-    if r.returncode != 0 or not dst.exists():
-        print(f"  [失败] {src.name}")
-        if r.stderr.strip():
-            print("         " + r.stderr.strip().replace("\n", "\n         "))
-        return False
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except Exception as e:
+            print(f"  [失败] {src.name}: {e}")
+            return False
 
-    if FIX_FORMULA:
-        fix_formula_images(dst, soffice, sizes)
+        if r.returncode != 0 or not dst.exists():
+            print(f"  [失败] {src.name}")
+            if r.stderr.strip():
+                print("         " + r.stderr.strip().replace("\n", "\n         "))
+            return False
+
+        if FIX_FORMULA:
+            fix_formula_images(dst, soffice, docx_image_sizes(pandoc_src))
 
     size_kb = dst.stat().st_size / 1024
     print(f"  [完成] {src.name}  →  {dst.name}  ({size_kb:.1f} KB)")
@@ -303,8 +335,10 @@ def main():
     pandoc = find_pandoc()
     print(f"[信息] 使用 pandoc: {pandoc}")
     soffice = find_soffice()
-    if FIX_FORMULA and soffice:
-        print(f"[信息] 公式图转换使用 LibreOffice: {soffice}")
+    if soffice:
+        print(f"[信息] 使用 LibreOffice: {soffice}（.doc 转换 / 公式图转换）")
+    else:
+        print("[信息] 没找到 LibreOffice：.doc 无法转换，公式图保持原样")
 
     work_dir = Path.cwd()
     print(f"[信息] 工作目录: {work_dir}")
@@ -328,8 +362,7 @@ def main():
     ok = fail = 0
     try:
         for src in files:
-            sizes = docx_image_sizes(src) if FIX_FORMULA else {}
-            if convert_one(pandoc, src, header_file, soffice, sizes):
+            if convert_one(pandoc, src, header_file, soffice):
                 ok += 1
             else:
                 fail += 1
